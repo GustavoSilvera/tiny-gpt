@@ -1,5 +1,6 @@
 from typing import List, Dict, Tuple
 import torch
+import numpy as np
 import os
 
 device = torch.device("cpu")
@@ -104,8 +105,19 @@ class BigramLanguageModel(torch.nn.Module):
         assert x.dtype == torch.int
         logits: torch.Tensor = self.embedding(x)
         assert logits.shape == (batch_size, block_size, self.vocab_size)
-        return logits
+        B, T, C = logits.shape
+
+        # negative log likelihood loss
+        # cross entropy operates on BxCxT (we have BxTxC) so we need to reshape
+        logits: torch.Tensor = logits.view(B * T, C)
+        targets: torch.Tensor = y.view(B * T)
+        loss: torch.Tensor = torch.nn.functional.cross_entropy(logits, targets)
+        return logits, loss
 
 
 m = BigramLanguageModel(C=vocabulary_size)
-print(m.forward(x, y).shape)
+logits, loss = m.forward(x, y)
+expected_loss: float = -np.log(1.0 / vocabulary_size)
+print(f"Using BigramLanguageModel on initial (untrained sample batch)")
+print(f"Initial prediction has loss: {loss:.2f}")
+print(f"Expected loss with uniform weights: {expected_loss:.2f}")
