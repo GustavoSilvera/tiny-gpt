@@ -1,5 +1,4 @@
-from typing import List, Dict
-import numpy as np
+from typing import List, Dict, Tuple
 import torch
 import os
 
@@ -66,3 +65,27 @@ cutoff: int = int(len(dataset_t) * percentage_for_training)
 train: torch.Tensor = dataset_t[:cutoff]
 val: torch.Tensor = dataset_t[cutoff:]
 print(f"Split dataset into training: {train.shape} and val: {val.shape}")
+print()
+
+# begin sampling blocks from the dataset
+block_size: int = 8  # size of the context that we train our transformer on
+batch_size: int = 4  # number of training instances happening at once (in parallel)
+seed: int = 1  # to fix the randomness
+torch.manual_seed(seed)
+
+
+def sample_batch(type: str = "train") -> Tuple[torch.Tensor, torch.Tensor]:
+    # sample a small segment of data from the dataset at random
+    data = train if type == "train" else val
+    start_idx = torch.randint(low=0, high=len(data) - block_size, size=(batch_size, 1))
+    x: torch.Tensor = torch.stack([data[i : i + block_size] for i in start_idx])
+    # offset x by 1 to get the "targets"
+    y: torch.Tensor = torch.stack([data[i + 1 : i + block_size + 1] for i in start_idx])
+    return x, y
+
+
+# example random chunks
+x, y = sample_batch()
+print(f"Example input batch ({x.shape}): \n{x}")
+print(f"Example output targets ({y.shape}): \n{y}")
+print()
