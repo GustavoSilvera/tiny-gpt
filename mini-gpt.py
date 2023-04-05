@@ -54,9 +54,7 @@ print("Decoder test: ", decoder(encoder("Hello There!")))
 print()
 
 # encoding the entire dataset and using Torch:
-dataset_t: torch.Tensor = torch.tensor(
-    encoder(dataset), dtype=torch.int8, device=device
-)
+dataset_t: torch.Tensor = torch.tensor(encoder(dataset), dtype=torch.int, device=device)
 print(f"Loaded entire dataset into torch Tensor: {dataset_t.shape}, {dataset_t.dtype}")
 
 # split dataset into training and validation
@@ -89,3 +87,25 @@ x, y = sample_batch()
 print(f"Example input batch ({x.shape}): \n{x}")
 print(f"Example output targets ({y.shape}): \n{y}")
 print()
+
+# begin a BigramLanguageModel impl
+
+
+class BigramLanguageModel(torch.nn.Module):
+    def __init__(self, C: int):
+        super().__init__()
+        # create an embedding table to map the tokens to the "next" tokens
+        self.vocab_size = C
+        self.embedding = torch.nn.Embedding(C, C, device=device)
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        assert x.shape == (batch_size, block_size)
+        assert y.shape == (batch_size, block_size)
+        assert x.dtype == torch.int
+        logits: torch.Tensor = self.embedding(x)
+        assert logits.shape == (batch_size, block_size, self.vocab_size)
+        return logits
+
+
+m = BigramLanguageModel(C=vocabulary_size)
+print(m.forward(x, y).shape)
