@@ -93,19 +93,30 @@ print()
 
 
 class BigramLanguageModel(torch.nn.Module):
-    def __init__(self, C: int):
+    def __init__(self, C: int, T: int, n_embed: int):
         super().__init__()
         # create an embedding table to map the tokens to the "next" tokens
         self.vocab_size = C
-        self.embedding = torch.nn.Embedding(C, C, device=device)
+        self.n_embed = n_embed
+        self.token_embedding = torch.nn.Embedding(C, n_embed, device=device)
+        self.posn_embedding = torch.nn.Embedding(T, n_embed)
+        self.lm_head = torch.nn.Linear(n_embed, C)  # language-model-head
 
     def forward(
         self, x: torch.Tensor, y: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         B, T = x.shape
+        C = self.n_embed
         assert y is None or y.shape == (B, T)
         assert x.dtype == torch.int
-        logits: torch.Tensor = self.embedding(x)
+        # add a layer of indirection to get from x -> embedding -> linear layer -> logits
+        tok_emb: torch.Tensor = self.token_embedding(x)
+        assert tok_emb.shape == (B, T, C)
+        pos_emb: torch.Tensor = self.posn_embedding(torch.arange(T, device=device))
+        assert pos_emb.shape == (T, C)
+        x = tok_emb + pos_emb  # broadcast the addition of pos_emb throughout batches
+        assert x.shape == (B, T, C)
+        logits: torch.Tensor = self.lm_head(x)
         assert logits.shape == (B, T, self.vocab_size)
         B, T, C = logits.shape
 
@@ -137,7 +148,8 @@ class BigramLanguageModel(torch.nn.Module):
         return x
 
 
-m = BigramLanguageModel(C=vocabulary_size)
+n_embed: int = 32
+m = BigramLanguageModel(C=vocabulary_size, T=block_size, n_embed=n_embed)
 m = m.to(device)
 logits, loss = m.forward(x, y)
 expected_loss: float = -np.log(1.0 / vocabulary_size)
@@ -175,7 +187,7 @@ optimizer = torch.optim.AdamW(m.parameters(), lr=1e-3)
 
 # more batches!
 batch_size: int = 32
-epochs: int = 1
+epochs: int = 1000
 eval_iter: int = 200
 train_loss: Optional[float] = float("nan")
 val_loss: Optional[float] = float("nan")
@@ -186,13 +198,14 @@ for epoch in range(epochs):
     loss.backward()
     optimizer.step()
     print(
-        f"Training {epoch}/{epochs} ({100 * epoch / epochs}%) \t Train loss: {train_loss:.2f} \t Val loss: {val_loss:.2f}",
+        f"Training {epoch}/{epochs} \t ({100 * epoch / epochs}%) \t Train loss: {train_loss:.2f} \t Val loss: {val_loss:.2f}",
         end="\r",
         flush=True,
     )
     if epoch % eval_iter == 0:
         train_loss, val_loss = estimate_loss(num_iters=eval_iter)
         print()
+print()
 print()
 print(f"Total loss after {epochs} epochs: {loss.item():.2f}")
 pred_s = decoder(m.generate(x0, maximum_out_len=100)[0].tolist())
