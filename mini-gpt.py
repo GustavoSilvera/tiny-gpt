@@ -175,7 +175,7 @@ optimizer = torch.optim.AdamW(m.parameters(), lr=1e-3)
 
 # more batches!
 batch_size: int = 32
-epochs: int = 10000
+epochs: int = 1
 eval_iter: int = 200
 train_loss: Optional[float] = float("nan")
 val_loss: Optional[float] = float("nan")
@@ -193,6 +193,64 @@ for epoch in range(epochs):
     if epoch % eval_iter == 0:
         train_loss, val_loss = estimate_loss(num_iters=eval_iter)
         print()
+print()
 print(f"Total loss after {epochs} epochs: {loss.item():.2f}")
 pred_s = decoder(m.generate(x0, maximum_out_len=100)[0].tolist())
 print(f'Trained prediction starting with "{initial_s}" is "{pred_s}"')
+print()
+
+# mathematical trick in self attention to optimize the incremental averaging
+# goal: want xBOW[b, t] = mean_{i <= t} x[b, i] # incremental averaging
+
+
+def compute_xBOW_naive(x: torch.Tensor) -> torch.Tensor:
+    # the general idea of incremental averaging, but this is very slow. Don't use!
+    B, T, C = x.shape
+    xBOW: torch.Tensor = torch.zeros_like(x)
+    for b in range(B):
+        for t in range(T):
+            xBOW[b, t] = torch.mean(x[b, : t + 1], axis=0, dtype=torch.float)
+    assert xBOW.shape == (B, T, C)
+    return xBOW
+
+
+def compute_xBOW_matmul(x: torch.Tensor) -> torch.Tensor:
+    B, T, C = x.shape
+    # can accomplish this via matrix multiplication with a lower-triangular matrix where all the rows
+    # sum to 1 and nonzero row elements are equal
+    # [1.00, 0.00, 0.00]
+    # [0.50, 0.50, 0.00]
+    # [0.33, 0.33, 0.33]
+    inc_avg_mat: torch.Tensor = torch.tril(torch.ones(T, T))  # weighted summing
+    inc_avg_mat /= inc_avg_mat.sum(axis=1, keepdim=True)
+    # (B x T x T) @ (B x T x C) -> (B x ((T x T) @ (T x c))) -> (B x T x C) :)
+    xBOW: torch.Tensor = inc_avg_mat @ x
+    assert xBOW.shape == (B, T, C)
+    return xBOW
+
+
+def compute_xBOW_softmax(
+    x: torch.Tensor, z: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    B, T, C = x.shape
+    # enables more flexibility than compute_xBOW_matmul by allowins the initial weights to be
+    # more interesting than just 1's and 0's
+    tri_lower: torch.Tensor = torch.tril(torch.ones(T, T))  # weighted summing
+    # clamping/preventing tokens from talking to the future
+    tri_lower[tri_lower == 0] = -float("inf")  # exp(-inf) -> 0 to not contribute
+    if z is not None:
+        tri_lower *= z  # element wise product (more interesting than just 1's)
+    inc_avg_mat = torch.nn.functional.softmax(tri_lower, dim=-1)
+    xBOW: torch.Tensor = inc_avg_mat @ x
+    assert xBOW.shape == (B, T, C)
+    return xBOW
+
+
+x = torch.randn(10, 4, 3)  # for example
+xBOW1 = compute_xBOW_naive(x)
+xBOW2 = compute_xBOW_matmul(x)
+xBOW3 = compute_xBOW_softmax(x)
+print(
+    "Bag of words correctness: ",
+    torch.allclose(xBOW1, xBOW2) and torch.allclose(xBOW1, xBOW3),
+)
