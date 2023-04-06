@@ -151,4 +151,22 @@ x0: torch.Tensor = (
     torch.ones(size=(1, 1), dtype=torch.int, device=device) * initial_i
 )  # 1x1 block
 pred_s: str = decoder(m.generate(x0, maximum_out_len=num)[0].tolist())
-print(f'Initial ({num}) prediction starting with "{initial_s}" is "{pred_s}"')
+print(f'Initial random ({num}) prediction starting with "{initial_s}" is "{pred_s}"')
+print()
+
+# train the model so its not just purely random
+optimizer = torch.optim.AdamW(m.parameters(), lr=1e-3)
+
+# more batches!
+batch_size: int = 32
+epochs: int = 10000
+for epoch in range(epochs):
+    xb, yb = sample_batch()
+    logits, loss = m.forward(xb, yb)
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    optimizer.step()
+    print(f"Training ({epochs}): {100 * epoch / epochs}%", end="\r", flush=True)
+print(f"Total loss after {epochs} epochs: {loss.item():.2f}")
+pred_s = decoder(m.generate(x0, maximum_out_len=num)[0].tolist())
+print(f'Trained prediction starting with "{initial_s}" is "{pred_s}"')
