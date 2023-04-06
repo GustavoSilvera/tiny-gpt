@@ -1,4 +1,4 @@
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 import torch
 import numpy as np
 import os
@@ -99,25 +99,56 @@ class BigramLanguageModel(torch.nn.Module):
         self.vocab_size = C
         self.embedding = torch.nn.Embedding(C, C, device=device)
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        assert x.shape == (batch_size, block_size)
-        assert y.shape == (batch_size, block_size)
+    def forward(
+        self, x: torch.Tensor, y: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        B, T = x.shape
+        assert y is None or y.shape == (B, T)
         assert x.dtype == torch.int
         logits: torch.Tensor = self.embedding(x)
-        assert logits.shape == (batch_size, block_size, self.vocab_size)
+        assert logits.shape == (B, T, self.vocab_size)
         B, T, C = logits.shape
 
-        # negative log likelihood loss
-        # cross entropy operates on BxCxT (we have BxTxC) so we need to reshape
-        logits: torch.Tensor = logits.view(B * T, C)
-        targets: torch.Tensor = y.view(B * T)
-        loss: torch.Tensor = torch.nn.functional.cross_entropy(logits, targets)
+        if y is not None:
+            # negative log likelihood loss
+            # cross entropy operates on BxCxT (we have BxTxC) so we need to reshape
+            logits: torch.Tensor = logits.view(B * T, C)
+            targets: torch.Tensor = y.view(B * T)
+            loss: torch.Tensor = torch.nn.functional.cross_entropy(logits, targets)
+        else:
+            loss = None
         return logits, loss
+
+    def generate(self, x: torch.Tensor, maximum_out_len: int) -> torch.Tensor:
+        B, T = x.shape
+        C: int = self.vocab_size
+        # generate more sequences (up to maximum_out_len) by concatenating into a running stream
+        for _ in range(maximum_out_len):
+            logits, _ = self.forward(x)  # don't care about loss, not training
+            logits = logits[:, -1, :]  # only take last of block_size
+            assert logits.shape == (B, C)  # new shape is (B, C)
+            dist = torch.nn.functional.softmax(logits, dim=1)  # to probabilities
+            assert dist.shape == logits.shape
+            next_x = torch.multinomial(dist, num_samples=1)  # generate a next char
+            assert next_x.shape == (B, 1)  # only a single sample
+            x = torch.cat((x, next_x), dim=1).type(x.dtype)  # concat to running stream
+            assert x.shape == (B, T + 1)
+            T += 1  # for the future predictions
+        return x
 
 
 m = BigramLanguageModel(C=vocabulary_size)
+m = m.to(device)
 logits, loss = m.forward(x, y)
 expected_loss: float = -np.log(1.0 / vocabulary_size)
 print(f"Using BigramLanguageModel on initial (untrained sample batch)")
 print(f"Initial prediction has loss: {loss:.2f}")
 print(f"Expected loss with uniform weights: {expected_loss:.2f}")
+initial_i: int = 1  # space
+initial_s: str = decoder([initial_i])
+num: int = 10
+x0: torch.Tensor = (
+    torch.ones(size=(1, 1), dtype=torch.int, device=device) * initial_i
+)  # 1x1 block
+pred_s: str = decoder(m.generate(x0, maximum_out_len=num)[0].tolist())
+print(f'Initial ({num}) prediction starting with "{initial_s}" is "{pred_s}"')
