@@ -154,19 +154,45 @@ pred_s: str = decoder(m.generate(x0, maximum_out_len=num)[0].tolist())
 print(f'Initial random ({num}) prediction starting with "{initial_s}" is "{pred_s}"')
 print()
 
+# create a loss estimator for averaging training and val loss
+def estimate_loss(num_iters: int = 200) -> Tuple[float, float]:
+    losses: Dict[str, float] = {}
+    with torch.no_grad():  # no need to track gradients (lower memory footprint)
+        m.eval()  # switch to evaluation mode
+        for split in ["train", "val"]:
+            cumulative_loss: float = 0
+            for _ in range(num_iters):
+                xb, yb = sample_batch(split)
+                _, loss = m.forward(xb, yb)
+                cumulative_loss += loss.item()
+            losses[split] = cumulative_loss / num_iters
+        m.train()  # back to training phase
+    return losses["train"], losses["val"]
+
+
 # train the model so its not just purely random
 optimizer = torch.optim.AdamW(m.parameters(), lr=1e-3)
 
 # more batches!
 batch_size: int = 32
 epochs: int = 10000
+eval_iter: int = 200
+train_loss: Optional[float] = float("nan")
+val_loss: Optional[float] = float("nan")
 for epoch in range(epochs):
     xb, yb = sample_batch()
     logits, loss = m.forward(xb, yb)
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     optimizer.step()
-    print(f"Training ({epochs}): {100 * epoch / epochs}%", end="\r", flush=True)
+    print(
+        f"Training {epoch}/{epochs} ({100 * epoch / epochs}%) \t Train loss: {train_loss:.2f} \t Val loss: {val_loss:.2f}",
+        end="\r",
+        flush=True,
+    )
+    if epoch % eval_iter == 0:
+        train_loss, val_loss = estimate_loss(num_iters=eval_iter)
+        print()
 print(f"Total loss after {epochs} epochs: {loss.item():.2f}")
-pred_s = decoder(m.generate(x0, maximum_out_len=num)[0].tolist())
+pred_s = decoder(m.generate(x0, maximum_out_len=100)[0].tolist())
 print(f'Trained prediction starting with "{initial_s}" is "{pred_s}"')
