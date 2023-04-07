@@ -61,16 +61,17 @@ print(f"Split dataset into training: {train.shape} and val: {val.shape}")
 print()
 
 # begin sampling blocks from the dataset
-block_size: int = 8  # size of the context that we train our transformer on
+block_size: int = 256  # size of the context that we train our transformer on
 batch_size: int = 64  # number of training instances happening at once (in parallel)
 seed: int = 1  # to fix the randomness
 torch.manual_seed(seed)
-epochs: int = 3000
-eval_iter: int = 200
-n_embed: int = 32
-lr: float = 1e-3
-n_layer: int = 3
-num_heads: int = 4
+epochs: int = 4000
+eval_iter: int = 500
+n_embed: int = 384
+lr: float = 3e-4
+n_layer: int = 6
+num_heads: int = 6  # every head is 64-dimensional
+dropout: float = 0.2  # percent of indermediate calculations that are disabled
 
 
 def sample_batch(type: str = "train") -> Tuple[torch.Tensor, torch.Tensor]:
