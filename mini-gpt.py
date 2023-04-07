@@ -2,15 +2,9 @@ from typing import List, Dict, Tuple, Optional
 import torch
 import numpy as np
 import os
+from bow import compute_xBOW_softmax
+from utils import *
 
-device = torch.device("cpu")
-if torch.backends.mps.is_available():
-    device = torch.device("mps")
-    print("Using Apple M1 Metal GPU acceleration!")
-if torch.cuda.is_available():
-    device = torch.device("cuda")
-    print("Using NVidia Cuda acceleration!")
-print()
 
 # Karpathy's tiny-shakespeare
 dataset = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
@@ -68,9 +62,13 @@ print()
 
 # begin sampling blocks from the dataset
 block_size: int = 8  # size of the context that we train our transformer on
-batch_size: int = 4  # number of training instances happening at once (in parallel)
+batch_size: int = 32  # number of training instances happening at once (in parallel)
 seed: int = 1  # to fix the randomness
 torch.manual_seed(seed)
+epochs: int = 1000
+eval_iter: int = 200
+n_embed: int = 32
+lr: float = 1e-3
 
 
 def sample_batch(type: str = "train") -> Tuple[torch.Tensor, torch.Tensor]:
@@ -85,9 +83,52 @@ def sample_batch(type: str = "train") -> Tuple[torch.Tensor, torch.Tensor]:
 
 # example random chunks
 x, y = sample_batch()
-print(f"Example input batch ({x.shape}): \n{x}")
-print(f"Example output targets ({y.shape}): \n{y}")
+num_print: int = min(batch_size, 8)
+first_str = f"first {num_print} out of " if num_print != batch_size else ""
+print(f"Example input batch ({first_str}{x.shape}): \n{x[:num_print]}")
+print(f"Example output targets ({first_str}{y.shape}): \n{y[:num_print]}")
 print()
+
+
+# create a head of self attention following the Attention is All You Need paper
+# https://arxiv.org/pdf/1706.03762.pdf
+# "Scaled Dot-Product Attention": Attention(Q, K, V) = softmax((Q @ K.T)/sqrt(C)) @ V
+
+
+class AttHead(torch.nn.Module):
+    # one "Head" of self attention
+    def __init__(self, head_size: int):
+        super().__init__()
+        # keys represent what the current token knows about itself (ex. is a vowel)
+        self.key = torch.nn.Linear(n_embed, head_size, bias=False)
+        # queries represent what information the token wants from the aggregations
+        # ex. wants constanants or wants 2-positions ahead, etc.
+        self.queries = torch.nn.Linear(n_embed, head_size, bias=False)
+        self.values = torch.nn.Linear(n_embed, head_size, bias=False)
+        # self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
+        self.tril = torch.tril(torch.ones((block_size, block_size), device=device))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, C = x.shape
+        K = self.key.forward(x)
+        assert K.shape == (B, T, C)
+        Q = self.queries.forward(x)  # self attention bc x is used for both K and Q
+        assert Q.shape == (B, T, C)
+        # compute attention scores ("scaled affinities")
+        # the Q and K peform batched matrix multiply: (B,T,C) @ (B,C,T)->(B,T,T)
+        # divide by sqrt for scaled attention (normalizes variance)
+        W = Q @ K.transpose(dim0=-2, dim1=-1) * (C**-0.5)
+        assert W.shape == (B, T, T)
+        # effectively doing the same thing as xBOW-softmax
+        W[:, self.tril[:T, :T] == 0] = -float("inf")  # prohibiting future comms
+        W = torch.nn.functional.softmax(W, dim=-1)
+        assert W.shape == (B, T, T)
+        V = self.values.forward(x)
+        assert V.shape == (B, T, C)
+        out = W @ V  # (B,T,T) @ (B,T,C) -> (B,T,C)
+        assert out.shape == (B, T, C)
+        return out
+
 
 # begin a BigramLanguageModel impl
 
@@ -98,8 +139,9 @@ class BigramLanguageModel(torch.nn.Module):
         # create an embedding table to map the tokens to the "next" tokens
         self.vocab_size = C
         self.n_embed = n_embed
-        self.token_embedding = torch.nn.Embedding(C, n_embed, device=device)
+        self.token_embedding = torch.nn.Embedding(C, n_embed)
         self.posn_embedding = torch.nn.Embedding(T, n_embed)
+        self.sa_head = AttHead(n_embed)  # self-attention-head
         self.lm_head = torch.nn.Linear(n_embed, C)  # language-model-head
 
     def forward(
@@ -115,6 +157,7 @@ class BigramLanguageModel(torch.nn.Module):
         pos_emb: torch.Tensor = self.posn_embedding(torch.arange(T, device=device))
         assert pos_emb.shape == (T, C)
         x = tok_emb + pos_emb  # broadcast the addition of pos_emb throughout batches
+        x = self.sa_head.forward(x)  # install self-attention
         assert x.shape == (B, T, C)
         logits: torch.Tensor = self.lm_head(x)
         assert logits.shape == (B, T, self.vocab_size)
@@ -124,7 +167,7 @@ class BigramLanguageModel(torch.nn.Module):
             # negative log likelihood loss
             # cross entropy operates on BxCxT (we have BxTxC) so we need to reshape
             logits: torch.Tensor = logits.view(B * T, C)
-            targets: torch.Tensor = y.view(B * T)
+            targets: torch.Tensor = y.view(B * T).type(torch.long)
             loss: torch.Tensor = torch.nn.functional.cross_entropy(logits, targets)
         else:
             loss = None
@@ -135,7 +178,8 @@ class BigramLanguageModel(torch.nn.Module):
         C: int = self.vocab_size
         # generate more sequences (up to maximum_out_len) by concatenating into a running stream
         for _ in range(maximum_out_len):
-            logits, _ = self.forward(x)  # don't care about loss, not training
+            x_safe = x[:, -block_size:]  # crop to last {block_size} tokens (to fit)
+            logits, _ = self.forward(x_safe)  # don't care about loss, not training
             logits = logits[:, -1, :]  # only take last of block_size
             assert logits.shape == (B, C)  # new shape is (B, C)
             dist = torch.nn.functional.softmax(logits, dim=1)  # to probabilities
@@ -148,7 +192,6 @@ class BigramLanguageModel(torch.nn.Module):
         return x
 
 
-n_embed: int = 32
 m = BigramLanguageModel(C=vocabulary_size, T=block_size, n_embed=n_embed)
 m = m.to(device)
 logits, loss = m.forward(x, y)
@@ -158,12 +201,9 @@ print(f"Initial prediction has loss: {loss:.2f}")
 print(f"Expected loss with uniform weights: {expected_loss:.2f}")
 initial_i: int = 1  # space
 initial_s: str = decoder([initial_i])
-num: int = 10
-x0: torch.Tensor = (
-    torch.ones(size=(1, 1), dtype=torch.int, device=device) * initial_i
-)  # 1x1 block
-pred_s: str = decoder(m.generate(x0, maximum_out_len=num)[0].tolist())
-print(f'Initial random ({num}) prediction starting with "{initial_s}" is "{pred_s}"')
+x0: torch.Tensor = torch.ones((1, 1), dtype=torch.int, device=device) * initial_i  # 1x1
+pred_s: str = decoder(m.generate(x0, maximum_out_len=10)[0].tolist())
+print(f'Initial random (10) prediction starting with "{initial_s}" is "{pred_s}"')
 print()
 
 # create a loss estimator for averaging training and val loss
@@ -183,12 +223,8 @@ def estimate_loss(num_iters: int = 200) -> Tuple[float, float]:
 
 
 # train the model so its not just purely random
-optimizer = torch.optim.AdamW(m.parameters(), lr=1e-3)
+optimizer = torch.optim.AdamW(m.parameters(), lr=lr)
 
-# more batches!
-batch_size: int = 32
-epochs: int = 1000
-eval_iter: int = 200
 train_loss: Optional[float] = float("nan")
 val_loss: Optional[float] = float("nan")
 for epoch in range(epochs):
@@ -211,59 +247,3 @@ print(f"Total loss after {epochs} epochs: {loss.item():.2f}")
 pred_s = decoder(m.generate(x0, maximum_out_len=100)[0].tolist())
 print(f'Trained prediction starting with "{initial_s}" is "{pred_s}"')
 print()
-
-# mathematical trick in self attention to optimize the incremental averaging
-# goal: want xBOW[b, t] = mean_{i <= t} x[b, i] # incremental averaging
-
-
-def compute_xBOW_naive(x: torch.Tensor) -> torch.Tensor:
-    # the general idea of incremental averaging, but this is very slow. Don't use!
-    B, T, C = x.shape
-    xBOW: torch.Tensor = torch.zeros_like(x)
-    for b in range(B):
-        for t in range(T):
-            xBOW[b, t] = torch.mean(x[b, : t + 1], axis=0, dtype=torch.float)
-    assert xBOW.shape == (B, T, C)
-    return xBOW
-
-
-def compute_xBOW_matmul(x: torch.Tensor) -> torch.Tensor:
-    B, T, C = x.shape
-    # can accomplish this via matrix multiplication with a lower-triangular matrix where all the rows
-    # sum to 1 and nonzero row elements are equal
-    # [1.00, 0.00, 0.00]
-    # [0.50, 0.50, 0.00]
-    # [0.33, 0.33, 0.33]
-    inc_avg_mat: torch.Tensor = torch.tril(torch.ones(T, T))  # weighted summing
-    inc_avg_mat /= inc_avg_mat.sum(axis=1, keepdim=True)
-    # (B x T x T) @ (B x T x C) -> (B x ((T x T) @ (T x c))) -> (B x T x C) :)
-    xBOW: torch.Tensor = inc_avg_mat @ x
-    assert xBOW.shape == (B, T, C)
-    return xBOW
-
-
-def compute_xBOW_softmax(
-    x: torch.Tensor, z: Optional[torch.Tensor] = None
-) -> torch.Tensor:
-    B, T, C = x.shape
-    # enables more flexibility than compute_xBOW_matmul by allowins the initial weights to be
-    # more interesting than just 1's and 0's
-    tri_lower: torch.Tensor = torch.tril(torch.ones(T, T))  # weighted summing
-    # clamping/preventing tokens from talking to the future
-    tri_lower[tri_lower == 0] = -float("inf")  # exp(-inf) -> 0 to not contribute
-    if z is not None:
-        tri_lower *= z  # element wise product (more interesting than just 1's)
-    inc_avg_mat = torch.nn.functional.softmax(tri_lower, dim=-1)
-    xBOW: torch.Tensor = inc_avg_mat @ x
-    assert xBOW.shape == (B, T, C)
-    return xBOW
-
-
-x = torch.randn(10, 4, 3)  # for example
-xBOW1 = compute_xBOW_naive(x)
-xBOW2 = compute_xBOW_matmul(x)
-xBOW3 = compute_xBOW_softmax(x)
-print(
-    "Bag of words correctness: ",
-    torch.allclose(xBOW1, xBOW2) and torch.allclose(xBOW1, xBOW3),
-)
