@@ -66,11 +66,11 @@ batch_size: int = 64  # number of training instances happening at once (in paral
 seed: int = 1  # to fix the randomness
 torch.manual_seed(seed)
 epochs: int = 500
-eval_iter: int = 50
-n_embed: int = 384
-lr: float = 0.001
+eval_iter: int = 100
+n_embed: int = 384  # should be a multiple of num_heads
+lr: float = 3e-4
 n_layer: int = 6
-num_heads: int = 6  # every head is 64-dimensional
+num_heads: int = 6  # every head is {n_embed//num_heads}-dimensional
 dropout: float = 0.2  # percent of indermediate calculations that are disabled
 os.makedirs("saves", exist_ok=True)
 
@@ -79,6 +79,7 @@ def sample_batch(type: str = "train") -> Tuple[torch.Tensor, torch.Tensor]:
     # sample a small segment of data from the dataset at random
     data = train if type == "train" else val
     start_idx = torch.randint(low=0, high=len(data) - block_size, size=(batch_size, 1))
+    # TODO: vectorize
     x: torch.Tensor = torch.stack([data[i : i + block_size] for i in start_idx])
     # offset x by 1 to get the "targets"
     y: torch.Tensor = torch.stack([data[i + 1 : i + block_size + 1] for i in start_idx])
@@ -161,7 +162,7 @@ class MultiHeadAttention(torch.nn.Module):
         return self.dropout.forward(self.proj.forward(out))
 
 
-class FeedForward(torch.nn.Module):
+class FeedForward(torch.nn.Module):  # simple MLP
     def __init__(self, N: int):
         super().__init__()
         self.layers = torch.nn.Sequential(
@@ -175,12 +176,59 @@ class FeedForward(torch.nn.Module):
         return self.layers.forward(x)
 
 
+# same as MultiHeadAttention but vectorized over heads
+class CausalSelfAttention(torch.nn.Module):
+    def __init__(self, num_heads: int):
+        super().__init__()
+        # create attention layer (note 3x out dim for key, query, values)
+        self.attn = torch.nn.Linear(n_embed, 3 * n_embed)
+        # projection is linear transformation of the concatenated attentions
+        self.proj = torch.nn.Linear(n_embed, n_embed)
+        self.num_heads = num_heads
+        # regularization
+        self.attn_dropout = torch.nn.Dropout(dropout)
+        self.resid_dropout = torch.nn.Dropout(dropout)
+        self.register_buffer("tril", torch.tril(torch.ones((block_size, block_size))))
+        assert hasattr(self, "tril") and self.tril is not None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, C = x.shape
+        assert C % self.num_heads == 0  # so division can take place evenly
+        Q, K, V = self.attn(x).split(n_embed, dim=2)  # extract 3 quantities at 2nd dim
+        nh = self.num_heads
+        # split the last dimension (C) into nh and C//nh
+        Q = Q.view(B, T, nh, C // nh).transpose(1, 2)
+        K = K.view(B, T, nh, C // nh).transpose(1, 2)
+        V = V.view(B, T, nh, C // nh).transpose(1, 2)
+        assert K.shape == Q.shape == V.shape == (B, nh, T, C // nh)
+        # compute attention scores ("scaled affinities")
+        # the Q and K peform batched matrix multiply: (B,T,C) @ (B,C,T)->(B,T,T)
+        # divide by sqrt for scaled attention (normalizes variance)
+        W = Q @ K.transpose(dim0=-2, dim1=-1) * (K.shape[-1] ** -0.5)
+        assert W.shape == (B, nh, T, T)
+        # effectively doing the same thing as xBOW-softmax
+        W[:, :, self.tril[:T, :T] == 0] = -float("inf")  # prohibiting future comms
+        W = torch.nn.functional.softmax(W, dim=-1)
+        assert W.shape == (B, nh, T, T)
+        # dropout is a regularization technique to randomly disable some nodes in the
+        # network and act like training several smaller ensembles of networks at once
+        # then at test time, averaging them to get an extra ~2% boost
+        W = self.attn_dropout.forward(W)  # (prevent some nodes from communicating)
+        out = W @ V  # (B,nh,T,T) @ (B,nh,T,C) -> (B,nh,T,C)
+        assert out.shape == (B, nh, T, C // nh)
+        out = out.transpose(1, 2).contiguous().view(B, T, C)
+        assert out.shape == (B, T, C)
+        out = self.resid_dropout(self.proj(out))
+        return out
+
+
 # attention block combining the MultiHeadAttention and a feed-forward layer
 class AttnBlock(torch.nn.Module):
     def __init__(self, n_embed: int, num_heads: int):
         super().__init__()
         assert n_embed % num_heads == 0  # to ensure equality
-        self.sa_heads = MultiHeadAttention(N=num_heads, head_size=n_embed // num_heads)
+        # self.sa_heads = MultiHeadAttention(N=num_heads, head_size=n_embed // num_heads)
+        self.sa_heads = CausalSelfAttention(num_heads=num_heads)
         self.feed_forward = FeedForward(n_embed)
         # layer norm is like batch normalization (make unit gaussian distribution of weights)
         # along the layers rather than the individual weights/biases
@@ -285,16 +333,18 @@ def estimate_loss(num_iters: int = 200) -> Tuple[float, float]:
     losses: Dict[str, float] = {}
     with torch.no_grad():  # no need to track gradients (lower memory footprint)
         m.eval()  # switch to evaluation mode
-        for split in ["train", "val"]:
+        for split in ["train", "valid"]:
             cumulative_loss: float = 0
             for i in range(num_iters):
                 xb, yb = sample_batch(split)
                 _, loss = m.forward(xb, yb)
                 cumulative_loss += loss.item()
-                print(f"Eval: {100 * i / num_iters :.1f}%", end="\r", flush=True)
+                print(
+                    f"({split}) Eval: {100 * i / num_iters:.0f}%", end="\r", flush=True
+                )
             losses[split] = cumulative_loss / num_iters
         m.train()  # back to training phase
-    return losses["train"], losses["val"]
+    return losses["train"], losses["valid"]
 
 
 # train the model so its not just purely random
@@ -309,16 +359,18 @@ for epoch in range(epochs):
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     optimizer.step()
-    scheduler.step(loss)
-    if epoch % eval_iter == 0:
+    # scheduler.step(loss)
+    est_loss: bool = epoch % eval_iter == eval_iter - 1
+    if est_loss:
         train_loss, val_loss = estimate_loss(num_iters=eval_iter)
         torch.save(m.state_dict(), os.path.join("saves", f"state_dict_{epoch}.pt"))
-        print()
     print(
-        f"Training {epoch}/{epochs} \t ({100 * epoch / epochs:.1f}%) \t Train loss: {train_loss:.2f} \t Val loss: {val_loss:.2f}",
+        f"Training {epoch:>4}/{epochs} \t ({100 * epoch / epochs:.1f}%) \t Train loss: {train_loss:.2f} \t Val loss: {val_loss:.2f}",
         end="\r",
         flush=True,
     )
+    if est_loss:
+        print()
 print()
 print()
 print(f"Total loss after {epochs} epochs: {loss.item():.2f}")
