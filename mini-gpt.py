@@ -171,11 +171,15 @@ class AttnBlock(torch.nn.Module):
         assert n_embed % num_heads == 0  # to ensure equality
         self.sa_heads = MultiHeadAttention(N=num_heads, head_size=n_embed // num_heads)
         self.feed_forward = FeedForward(n_embed)
+        # layer norm is like batch normalization (make unit gaussian distribution of weights)
+        # along the layers rather than the individual weights/biases
+        self.ln1 = torch.nn.LayerNorm(n_embed)
+        self.ln2 = torch.nn.LayerNorm(n_embed)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # using addition to encode residual connections (gradient-super-highway)
-        x = x + self.sa_heads.forward(x)
-        x = x + self.feed_forward.forward(x)
+        x = x + self.sa_heads.forward(self.ln1.forward(x))
+        x = x + self.feed_forward.forward(self.ln2.forward(x))
         return x
 
 
@@ -192,6 +196,7 @@ class BigramLanguageModel(torch.nn.Module):
             AttnBlock(n_embed=n_embed, num_heads=num_heads),
             AttnBlock(n_embed=n_embed, num_heads=num_heads),
             AttnBlock(n_embed=n_embed, num_heads=num_heads),
+            torch.nn.LayerNorm(n_embed),
         )
         self.lm_head = torch.nn.Linear(n_embed, C)  # language-model-head
 
