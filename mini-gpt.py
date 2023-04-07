@@ -105,8 +105,12 @@ class AttHead(torch.nn.Module):
         # ex. wants constanants or wants 2-positions ahead, etc.
         self.queries = torch.nn.Linear(n_embed, head_size, bias=False)
         self.values = torch.nn.Linear(n_embed, head_size, bias=False)
-        # self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
-        self.tril = torch.tril(torch.ones((block_size, block_size), device=device))
+        # registered as a buffer to be a "const" parameter that is not learned/trained
+        # in the training step for this model. Ie. it is not a parameter that torch cares about
+        # see https://discuss.pytorch.org/t/what-is-the-difference-between-register-buffer-and-register-parameter-of-nn-module/32723/3
+        self.register_buffer("tril", torch.tril(torch.ones((block_size, block_size))))
+        # self.tril = torch.tril(torch.ones((block_size, block_size), device=device)) # equivalent
+        assert hasattr(self, "tril") and self.tril is not None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.shape
