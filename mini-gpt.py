@@ -69,6 +69,8 @@ epochs: int = 3000
 eval_iter: int = 200
 n_embed: int = 32
 lr: float = 1e-3
+n_layer: int = 3
+num_heads: int = 4
 
 
 def sample_batch(type: str = "train") -> Tuple[torch.Tensor, torch.Tensor]:
@@ -184,21 +186,27 @@ class AttnBlock(torch.nn.Module):
 
 
 class BigramLanguageModel(torch.nn.Module):
-    def __init__(self, C: int, T: int, n_embed: int):
+    def __init__(self, C: int, T: int, n_embed: int, n_layer: int):
         super().__init__()
         # create an embedding table to map the tokens to the "next" tokens
         self.vocab_size = C
         self.n_embed = n_embed
         self.token_embedding = torch.nn.Embedding(C, n_embed)
         self.posn_embedding = torch.nn.Embedding(T, n_embed)
-        num_heads: int = 4
         self.attn_blocks = torch.nn.Sequential(
-            AttnBlock(n_embed=n_embed, num_heads=num_heads),
-            AttnBlock(n_embed=n_embed, num_heads=num_heads),
-            AttnBlock(n_embed=n_embed, num_heads=num_heads),
-            torch.nn.LayerNorm(n_embed),
+            *(
+                [
+                    AttnBlock(n_embed=n_embed, num_heads=num_heads)
+                    for _ in range(n_layer)  # how many attention block layers
+                ]
+                + [torch.nn.LayerNorm(n_embed)]  # finalize with a layernorm
+            )
         )
         self.lm_head = torch.nn.Linear(n_embed, C)  # language-model-head
+
+        print(
+            f"Created Bigram language model with {n_layer} layers with {n_embed} embeddings and {num_heads} heads"
+        )
 
     def forward(
         self, x: torch.Tensor, y: Optional[torch.Tensor] = None
@@ -247,7 +255,9 @@ class BigramLanguageModel(torch.nn.Module):
         return x
 
 
-m = BigramLanguageModel(C=vocabulary_size, T=block_size, n_embed=n_embed)
+m = BigramLanguageModel(
+    C=vocabulary_size, T=block_size, n_embed=n_embed, n_layer=n_layer
+)
 m = m.to(device)
 logits, loss = m.forward(x, y)
 expected_loss: float = -np.log(1.0 / vocabulary_size)
