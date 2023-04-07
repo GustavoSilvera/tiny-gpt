@@ -65,7 +65,7 @@ block_size: int = 8  # size of the context that we train our transformer on
 batch_size: int = 64  # number of training instances happening at once (in parallel)
 seed: int = 1  # to fix the randomness
 torch.manual_seed(seed)
-epochs: int = 1000
+epochs: int = 3000
 eval_iter: int = 200
 n_embed: int = 32
 lr: float = 1e-3
@@ -142,10 +142,41 @@ class MultiHeadAttention(torch.nn.Module):
         super().__init__()
         # create multiple (N) equal attention heads to run in parallel
         self.heads = torch.nn.ModuleList([AttHead(head_size) for _ in range(N)])
+        # projection is linear transformation of the concatenated attentions
+        self.proj = torch.nn.Linear(n_embed, n_embed)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # concatenate the result of running all the attention heads ("in parallel")
-        return torch.cat([head.forward(x) for head in self.heads], dim=-1)
+        out = torch.cat([head.forward(x) for head in self.heads], dim=-1)
+        return self.proj(out)
+
+
+class FeedForward(torch.nn.Module):
+    def __init__(self, N: int):
+        super().__init__()
+        self.layers = torch.nn.Sequential(
+            torch.nn.Linear(N, 4 * N),  # making deeper residual block
+            torch.nn.ReLU(),
+            torch.nn.Linear(4 * N, N),  # projection layer back into residual pathway
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.layers.forward(x)
+
+
+# attention block combining the MultiHeadAttention and a feed-forward layer
+class AttnBlock(torch.nn.Module):
+    def __init__(self, n_embed: int, num_heads: int):
+        super().__init__()
+        assert n_embed % num_heads == 0  # to ensure equality
+        self.sa_heads = MultiHeadAttention(N=num_heads, head_size=n_embed // num_heads)
+        self.feed_forward = FeedForward(n_embed)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # using addition to encode residual connections (gradient-super-highway)
+        x = x + self.sa_heads.forward(x)
+        x = x + self.feed_forward.forward(x)
+        return x
 
 
 class BigramLanguageModel(torch.nn.Module):
@@ -157,8 +188,11 @@ class BigramLanguageModel(torch.nn.Module):
         self.token_embedding = torch.nn.Embedding(C, n_embed)
         self.posn_embedding = torch.nn.Embedding(T, n_embed)
         num_heads: int = 4
-        assert n_embed % num_heads == 0  # to ensure equality
-        self.sa_heads = MultiHeadAttention(N=num_heads, head_size=n_embed // num_heads)
+        self.attn_blocks = torch.nn.Sequential(
+            AttnBlock(n_embed=n_embed, num_heads=num_heads),
+            AttnBlock(n_embed=n_embed, num_heads=num_heads),
+            AttnBlock(n_embed=n_embed, num_heads=num_heads),
+        )
         self.lm_head = torch.nn.Linear(n_embed, C)  # language-model-head
 
     def forward(
@@ -174,8 +208,7 @@ class BigramLanguageModel(torch.nn.Module):
         pos_emb: torch.Tensor = self.posn_embedding(torch.arange(T, device=device))
         assert pos_emb.shape == (T, C)
         x = tok_emb + pos_emb  # broadcast the addition of pos_emb throughout batches
-        x = self.sa_heads.forward(x)  # install self-attention
-        assert x.shape == (B, T, C)
+        x = self.attn_blocks.forward(x)  # install self-attention
         logits: torch.Tensor = self.lm_head(x)
         assert logits.shape == (B, T, self.vocab_size)
         B, T, C = logits.shape
@@ -251,7 +284,7 @@ for epoch in range(epochs):
     loss.backward()
     optimizer.step()
     print(
-        f"Training {epoch}/{epochs} \t ({100 * epoch / epochs}%) \t Train loss: {train_loss:.2f} \t Val loss: {val_loss:.2f}",
+        f"Training {epoch}/{epochs} \t ({100 * epoch / epochs:.1f}%) \t Train loss: {train_loss:.2f} \t Val loss: {val_loss:.2f}",
         end="\r",
         flush=True,
     )
