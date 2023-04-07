@@ -62,7 +62,7 @@ print()
 
 # begin sampling blocks from the dataset
 block_size: int = 8  # size of the context that we train our transformer on
-batch_size: int = 32  # number of training instances happening at once (in parallel)
+batch_size: int = 64  # number of training instances happening at once (in parallel)
 seed: int = 1  # to fix the randomness
 torch.manual_seed(seed)
 epochs: int = 1000
@@ -114,6 +114,9 @@ class AttHead(torch.nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.shape
+        xC = C  # keep track of the original C
+        # in case head_size < C from multi-head attention partitioning
+        C = self.key.out_features if self.key.out_features < C else C
         K = self.key.forward(x)
         assert K.shape == (B, T, C)
         Q = self.queries.forward(x)  # self attention bc x is used for both K and Q
@@ -121,7 +124,7 @@ class AttHead(torch.nn.Module):
         # compute attention scores ("scaled affinities")
         # the Q and K peform batched matrix multiply: (B,T,C) @ (B,C,T)->(B,T,T)
         # divide by sqrt for scaled attention (normalizes variance)
-        W = Q @ K.transpose(dim0=-2, dim1=-1) * (C**-0.5)
+        W = Q @ K.transpose(dim0=-2, dim1=-1) * (xC**-0.5)
         assert W.shape == (B, T, T)
         # effectively doing the same thing as xBOW-softmax
         W[:, self.tril[:T, :T] == 0] = -float("inf")  # prohibiting future comms
@@ -134,7 +137,15 @@ class AttHead(torch.nn.Module):
         return out
 
 
-# begin a BigramLanguageModel impl
+class MultiHeadAttention(torch.nn.Module):
+    def __init__(self, N: int, head_size: int):
+        super().__init__()
+        # create multiple (N) equal attention heads to run in parallel
+        self.heads = torch.nn.ModuleList([AttHead(head_size) for _ in range(N)])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # concatenate the result of running all the attention heads ("in parallel")
+        return torch.cat([head.forward(x) for head in self.heads], dim=-1)
 
 
 class BigramLanguageModel(torch.nn.Module):
@@ -145,7 +156,9 @@ class BigramLanguageModel(torch.nn.Module):
         self.n_embed = n_embed
         self.token_embedding = torch.nn.Embedding(C, n_embed)
         self.posn_embedding = torch.nn.Embedding(T, n_embed)
-        self.sa_head = AttHead(n_embed)  # self-attention-head
+        num_heads: int = 4
+        assert n_embed % num_heads == 0  # to ensure equality
+        self.sa_heads = MultiHeadAttention(N=num_heads, head_size=n_embed // num_heads)
         self.lm_head = torch.nn.Linear(n_embed, C)  # language-model-head
 
     def forward(
@@ -161,7 +174,7 @@ class BigramLanguageModel(torch.nn.Module):
         pos_emb: torch.Tensor = self.posn_embedding(torch.arange(T, device=device))
         assert pos_emb.shape == (T, C)
         x = tok_emb + pos_emb  # broadcast the addition of pos_emb throughout batches
-        x = self.sa_head.forward(x)  # install self-attention
+        x = self.sa_heads.forward(x)  # install self-attention
         assert x.shape == (B, T, C)
         logits: torch.Tensor = self.lm_head(x)
         assert logits.shape == (B, T, self.vocab_size)
