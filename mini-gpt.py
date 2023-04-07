@@ -65,13 +65,14 @@ block_size: int = 256  # size of the context that we train our transformer on
 batch_size: int = 64  # number of training instances happening at once (in parallel)
 seed: int = 1  # to fix the randomness
 torch.manual_seed(seed)
-epochs: int = 4000
-eval_iter: int = 500
+epochs: int = 500
+eval_iter: int = 50
 n_embed: int = 384
-lr: float = 3e-4
+lr: float = 0.001
 n_layer: int = 6
 num_heads: int = 6  # every head is 64-dimensional
 dropout: float = 0.2  # percent of indermediate calculations that are disabled
+os.makedirs("saves", exist_ok=True)
 
 
 def sample_batch(type: str = "train") -> Tuple[torch.Tensor, torch.Tensor]:
@@ -286,10 +287,11 @@ def estimate_loss(num_iters: int = 200) -> Tuple[float, float]:
         m.eval()  # switch to evaluation mode
         for split in ["train", "val"]:
             cumulative_loss: float = 0
-            for _ in range(num_iters):
+            for i in range(num_iters):
                 xb, yb = sample_batch(split)
                 _, loss = m.forward(xb, yb)
                 cumulative_loss += loss.item()
+                print(f"Eval: {100 * i / num_iters :.1f}%", end="\r", flush=True)
             losses[split] = cumulative_loss / num_iters
         m.train()  # back to training phase
     return losses["train"], losses["val"]
@@ -297,6 +299,7 @@ def estimate_loss(num_iters: int = 200) -> Tuple[float, float]:
 
 # train the model so its not just purely random
 optimizer = torch.optim.AdamW(m.parameters(), lr=lr)
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer)
 
 train_loss: Optional[float] = float("nan")
 val_loss: Optional[float] = float("nan")
@@ -306,14 +309,16 @@ for epoch in range(epochs):
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     optimizer.step()
+    scheduler.step(loss)
+    if epoch % eval_iter == 0:
+        train_loss, val_loss = estimate_loss(num_iters=eval_iter)
+        torch.save(m.state_dict(), os.path.join("saves", f"state_dict_{epoch}.pt"))
+        print()
     print(
         f"Training {epoch}/{epochs} \t ({100 * epoch / epochs:.1f}%) \t Train loss: {train_loss:.2f} \t Val loss: {val_loss:.2f}",
         end="\r",
         flush=True,
     )
-    if epoch % eval_iter == 0:
-        train_loss, val_loss = estimate_loss(num_iters=eval_iter)
-        print()
 print()
 print()
 print(f"Total loss after {epochs} epochs: {loss.item():.2f}")
