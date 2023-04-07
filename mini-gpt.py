@@ -113,6 +113,7 @@ class AttHead(torch.nn.Module):
         self.register_buffer("tril", torch.tril(torch.ones((block_size, block_size))))
         # self.tril = torch.tril(torch.ones((block_size, block_size), device=device)) # equivalent
         assert hasattr(self, "tril") and self.tril is not None
+        self.dropout = torch.nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.shape
@@ -132,6 +133,10 @@ class AttHead(torch.nn.Module):
         W[:, self.tril[:T, :T] == 0] = -float("inf")  # prohibiting future comms
         W = torch.nn.functional.softmax(W, dim=-1)
         assert W.shape == (B, T, T)
+        # dropout is a regularization technique to randomly disable some nodes in the
+        # network and act like training several smaller ensembles of networks at once
+        # then at test time, averaging them to get an extra ~2% boost
+        W = self.dropout.forward(W)  # (randomly prevent some nodes from communicating)
         V = self.values.forward(x)
         assert V.shape == (B, T, C)
         out = W @ V  # (B,T,T) @ (B,T,C) -> (B,T,C)
@@ -146,11 +151,12 @@ class MultiHeadAttention(torch.nn.Module):
         self.heads = torch.nn.ModuleList([AttHead(head_size) for _ in range(N)])
         # projection is linear transformation of the concatenated attentions
         self.proj = torch.nn.Linear(n_embed, n_embed)
+        self.dropout = torch.nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # concatenate the result of running all the attention heads ("in parallel")
         out = torch.cat([head.forward(x) for head in self.heads], dim=-1)
-        return self.proj(out)
+        return self.dropout.forward(self.proj.forward(out))
 
 
 class FeedForward(torch.nn.Module):
@@ -160,6 +166,7 @@ class FeedForward(torch.nn.Module):
             torch.nn.Linear(N, 4 * N),  # making deeper residual block
             torch.nn.ReLU(),
             torch.nn.Linear(4 * N, N),  # projection layer back into residual pathway
+            torch.nn.Dropout(dropout),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
